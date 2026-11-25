@@ -8,6 +8,7 @@ import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.ClearCredentialException
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.NoCredentialException
@@ -26,6 +27,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.tasks.await
@@ -76,6 +80,28 @@ private const val AUTH_TAG = "Auth"
 class AuthenticationProvider(
     private val firebaseAuth: FirebaseAuth = Firebase.auth
 ) {
+    private val _isLoading = MutableStateFlow(false)
+
+    /**
+     * Reactive loading state emitted while a Google Sign-In, auto sign-in, or sign-out
+     * operation is executing so the UI can show progress indicators and prevent duplicate taps.
+     */
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _authState = MutableStateFlow<AuthSessionEvent>(
+        firebaseAuth.currentUser?.let { AuthSessionEvent.Authenticated(it.toAuthenticatedAccount()) }
+            ?: AuthSessionEvent.Unauthenticated
+    )
+
+    /**
+     * Local snapshot of the current authentication session, updated immediately on sign-out
+     * and kept in sync with Firebase Auth state transitions.
+     */
+    val authState: StateFlow<AuthSessionEvent> = _authState.asStateFlow()
+
+    @Volatile
+    private var requireInteractiveSelection: Boolean = false
+
     /**
      * Current signed-in Firebase account, or null if unauthenticated.
      */
@@ -96,13 +122,13 @@ class AuthenticationProvider(
     fun observeAuthState(): Flow<AuthSessionEvent> = callbackFlow {
         val listener = FirebaseAuth.AuthStateListener { state ->
             val user = state.currentUser
-            trySend(
-                if (user != null) {
-                    AuthSessionEvent.Authenticated(user.toAuthenticatedAccount())
-                } else {
-                    AuthSessionEvent.Unauthenticated
-                }
-            )
+            val event = if (user != null) {
+                AuthSessionEvent.Authenticated(user.toAuthenticatedAccount())
+            } else {
+                AuthSessionEvent.Unauthenticated
+            }
+            _authState.value = event
+            trySend(event)
         }
         firebaseAuth.addAuthStateListener(listener)
         awaitClose {
@@ -113,11 +139,14 @@ class AuthenticationProvider(
     /**
      * Attempts silent returning-user sign-in using previously authorized Google credentials.
      *
-     * Uses a single [GetGoogleIdOption] per [GetCredentialRequest] for reliable system sheet
-     * handling. Returns [AuthActionResult.Cancelled] without surfacing an error when no prior
-     * authorized credential exists on the device.
+     * Skipped automatically after an explicit [signOut] so Credential Manager prompts the user
+     * to choose an account interactively instead of silently re-authenticating the previous session.
      */
     suspend fun attemptAutoSignIn(activityContext: Context): AuthActionResult {
+        if (requireInteractiveSelection) {
+            return AuthActionResult.Cancelled
+        }
+
         val existing = currentAccount
         if (existing != null) {
             return AuthActionResult.Success(account = existing, isNewUser = false)
@@ -175,21 +204,43 @@ class AuthenticationProvider(
     }
 
     /**
-     * Atomically clears Jetpack Credential Manager state and signs out of Firebase Auth.
+     * Terminates the active session cleanly:
+     * 1. Marks interactive selection as required so silent auto-login is suppressed.
+     * 2. Clears any caller-managed local auth/session markers via [onClearLocalState].
+     * 3. Clears Jetpack Credential Manager state ([ClearCredentialStateRequest]) so the next
+     *    sign-in prompts for Google account selection again.
+     * 4. Signs out of Firebase Auth and resets local [authState] to [AuthSessionEvent.Unauthenticated].
      *
-     * Runs inside [NonCancellable] so rapid UI navigation or scope cancellation never leaves a
-     * stale credential or half-cleared session behind.
+     * Runs inside [NonCancellable] so rapid UI unmount or scope cancellation cannot interrupt teardown.
      */
-    suspend fun signOut(context: Context) {
-        withContext(NonCancellable) {
-            try {
-                val credentialManager = CredentialManager.create(context)
-                credentialManager.clearCredentialState(ClearCredentialStateRequest())
-            } catch (e: Exception) {
-                Log.w(AUTH_TAG, "Credential state clear skipped during sign-out", e)
-            } finally {
-                firebaseAuth.signOut()
+    suspend fun signOut(
+        context: Context,
+        onClearLocalState: (suspend () -> Unit)? = null
+    ) {
+        _isLoading.value = true
+        requireInteractiveSelection = true
+        try {
+            withContext(NonCancellable) {
+                try {
+                    onClearLocalState?.invoke()
+                } catch (e: Exception) {
+                    Log.w(AUTH_TAG, "Local session cleanup threw during sign-out", e)
+                }
+
+                try {
+                    val credentialManager = CredentialManager.create(context)
+                    credentialManager.clearCredentialState(ClearCredentialStateRequest())
+                } catch (e: ClearCredentialException) {
+                    Log.w(AUTH_TAG, "Failed to clear Credential Manager state: ${e.errorMessage}", e)
+                } catch (e: Exception) {
+                    Log.w(AUTH_TAG, "Credential state clear skipped during sign-out", e)
+                } finally {
+                    firebaseAuth.signOut()
+                    _authState.value = AuthSessionEvent.Unauthenticated
+                }
             }
+        } finally {
+            _isLoading.value = false
         }
     }
 
@@ -198,6 +249,10 @@ class AuthenticationProvider(
         request: GetCredentialRequest,
         suppressNoCredentialError: Boolean
     ): AuthActionResult {
+        if (!_isLoading.compareAndSet(expect = false, update = true)) {
+            return AuthActionResult.Cancelled
+        }
+
         return try {
             val credentialManager = CredentialManager.create(activity)
             val response = credentialManager.getCredential(
@@ -218,9 +273,13 @@ class AuthenticationProvider(
             val firebaseUser = authResult.user
                 ?: return AuthActionResult.Error("Sign-in succeeded, but no user profile was returned.")
 
+            val account = firebaseUser.toAuthenticatedAccount()
+            requireInteractiveSelection = false
+            _authState.value = AuthSessionEvent.Authenticated(account)
+
             val isNewUser = authResult.additionalUserInfo?.isNewUser == true
             AuthActionResult.Success(
-                account = firebaseUser.toAuthenticatedAccount(),
+                account = account,
                 isNewUser = isNewUser
             )
         } catch (e: GetCredentialCancellationException) {
@@ -252,6 +311,8 @@ class AuthenticationProvider(
         } catch (e: Exception) {
             Log.e(AUTH_TAG, "Unexpected error during Google Sign-In", e)
             AuthActionResult.Error(e.localizedMessage ?: "Sign-in failed unexpectedly. Please try again.")
+        } finally {
+            _isLoading.value = false
         }
     }
 

@@ -141,6 +141,12 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
+            authProvider.isLoading.collect { loading ->
+                _uiState.update { it.copy(authBusy = loading) }
+            }
+        }
+
+        viewModelScope.launch {
             repository.purgeLegacyDemoAccountIfPresent()
             authProvider.observeAuthState().collect { event ->
                 when (event) {
@@ -163,6 +169,7 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
                             WalXUiState(
                                 authState = AuthUiState.Unauthenticated,
                                 darkMode = state.darkMode,
+                                authBusy = authProvider.isLoading.value,
                                 authError = state.authError,
                                 bannerMessage = state.bannerMessage
                             )
@@ -245,22 +252,20 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
 
     fun attemptAutoSignInIfEligible(activityContext: Context) {
         if (autoSignInAttempted || suppressAutoSignIn) return
-        if (_uiState.value.authState !is AuthUiState.Unauthenticated || _uiState.value.authBusy) return
+        if (_uiState.value.authState !is AuthUiState.Unauthenticated || authProvider.isLoading.value) return
         autoSignInAttempted = true
 
         viewModelScope.launch {
-            _uiState.update { it.copy(authBusy = true, authError = null) }
+            _uiState.update { it.copy(authError = null) }
             when (val result = authProvider.attemptAutoSignIn(activityContext)) {
                 is AuthActionResult.Success -> {
-                    _uiState.update { it.copy(authBusy = false, authError = null) }
+                    _uiState.update { it.copy(authError = null) }
                 }
 
-                AuthActionResult.Cancelled -> {
-                    _uiState.update { it.copy(authBusy = false) }
-                }
+                AuthActionResult.Cancelled -> Unit
 
                 is AuthActionResult.Error -> {
-                    _uiState.update { it.copy(authBusy = false, authError = result.message) }
+                    _uiState.update { it.copy(authError = result.message) }
                 }
             }
         }
@@ -272,7 +277,7 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
         startingCurrency: CurrencyCode = CurrencyCode.INR,
         startingBalance: Double = 0.0
     ) {
-        if (_uiState.value.authBusy) return
+        if (authProvider.isLoading.value) return
         suppressAutoSignIn = false
         pendingOnboardingPrefs = PendingOnboardingPrefs(
             displayName = preferredDisplayName?.trim()?.takeIf { it.length >= 2 },
@@ -281,7 +286,7 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         viewModelScope.launch {
-            _uiState.update { it.copy(authBusy = true, authError = null) }
+            _uiState.update { it.copy(authError = null) }
             when (val result = authProvider.signInWithGoogle(activityContext)) {
                 is AuthActionResult.Success -> {
                     val welcome = if (result.isNewUser) {
@@ -289,7 +294,7 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         "Signed in as ${result.account.displayName}."
                     }
-                    _uiState.update { it.copy(authBusy = false, authError = null, bannerMessage = welcome) }
+                    _uiState.update { it.copy(authError = null, bannerMessage = welcome) }
                 }
 
                 AuthActionResult.Cancelled -> {
@@ -310,10 +315,12 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
         pendingOnboardingPrefs = null
         userDataJob?.cancel()
         aiInsightsJob?.cancel()
-        repository.clearLocalSessionMarker()
 
         viewModelScope.launch {
-            authProvider.signOut(context)
+            authProvider.signOut(
+                context = context,
+                onClearLocalState = { repository.clearLocalSessionMarker() }
+            )
             _uiState.update { state ->
                 WalXUiState(
                     authState = AuthUiState.Unauthenticated,
