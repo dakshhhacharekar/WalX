@@ -1,6 +1,8 @@
 package com.example.auth
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.util.Log
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
@@ -9,6 +11,7 @@ import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.NoCredentialException
+import com.example.R
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -66,21 +69,24 @@ private const val AUTH_TAG = "Auth"
  *
  * Manages user sessions, silent auto sign-in for returning users, interactive Google Sign-In /
  * Sign-Up via Jetpack Credential Manager, and leak-free session teardown on sign-out.
+ *
+ * Resolves the Web Client ID strictly from [R.string.default_web_client_id], which is
+ * auto-generated at build time by the Google Services Gradle plugin from `app/google-services.json`.
  */
 class AuthenticationProvider(
-    private val firebaseAuth: FirebaseAuth? = runCatching { Firebase.auth }.getOrNull()
+    private val firebaseAuth: FirebaseAuth = Firebase.auth
 ) {
     /**
      * Current signed-in Firebase account, or null if unauthenticated.
      */
     val currentAccount: AuthenticatedAccount?
-        get() = firebaseAuth?.currentUser?.toAuthenticatedAccount()
+        get() = firebaseAuth.currentUser?.toAuthenticatedAccount()
 
     /**
      * Returns the verified Firebase UID for the current session, or throws if unauthenticated.
      */
     fun requireUserId(): String =
-        firebaseAuth?.currentUser?.uid
+        firebaseAuth.currentUser?.uid
             ?: throw IllegalStateException("User must be signed in to access WalX data.")
 
     /**
@@ -88,12 +94,6 @@ class AuthenticationProvider(
      * token refresh, and sign-out.
      */
     fun observeAuthState(): Flow<AuthSessionEvent> = callbackFlow {
-        val auth = firebaseAuth
-        if (auth == null) {
-            trySend(AuthSessionEvent.Unauthenticated)
-            close()
-            return@callbackFlow
-        }
         val listener = FirebaseAuth.AuthStateListener { state ->
             val user = state.currentUser
             trySend(
@@ -104,9 +104,9 @@ class AuthenticationProvider(
                 }
             )
         }
-        auth.addAuthStateListener(listener)
+        firebaseAuth.addAuthStateListener(listener)
         awaitClose {
-            auth.removeAuthStateListener(listener)
+            firebaseAuth.removeAuthStateListener(listener)
         }
     }.distinctUntilChanged()
 
@@ -123,8 +123,8 @@ class AuthenticationProvider(
             return AuthActionResult.Success(account = existing, isNewUser = false)
         }
 
-        val webClientId = resolveWebClientId(activityContext)
-            ?: return AuthActionResult.Cancelled
+        val activity = activityContext.findActivity() ?: return AuthActionResult.Cancelled
+        val webClientId = resolveWebClientId(activity) ?: return AuthActionResult.Cancelled
 
         val googleIdOption = GetGoogleIdOption.Builder()
             .setFilterByAuthorizedAccounts(true)
@@ -137,7 +137,7 @@ class AuthenticationProvider(
             .build()
 
         return executeCredentialSignIn(
-            activityContext = activityContext,
+            activity = activity,
             request = request,
             suppressNoCredentialError = true
         )
@@ -150,9 +150,14 @@ class AuthenticationProvider(
      * users can select or create their Google-backed WalX session reliably.
      */
     suspend fun signInWithGoogle(activityContext: Context): AuthActionResult {
-        val webClientId = resolveWebClientId(activityContext)
+        val activity = activityContext.findActivity()
             ?: return AuthActionResult.Error(
-                "Google Sign-In is not configured for this build. Please verify Firebase setup."
+                "Unable to launch Google Sign-In from the current screen. Please reopen WalX and try again."
+            )
+
+        val webClientId = resolveWebClientId(activity)
+            ?: return AuthActionResult.Error(
+                "Google Sign-In configuration missing: default_web_client_id was not generated from google-services.json."
             )
 
         val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = webClientId)
@@ -163,7 +168,7 @@ class AuthenticationProvider(
             .build()
 
         return executeCredentialSignIn(
-            activityContext = activityContext,
+            activity = activity,
             request = request,
             suppressNoCredentialError = false
         )
@@ -183,25 +188,20 @@ class AuthenticationProvider(
             } catch (e: Exception) {
                 Log.w(AUTH_TAG, "Credential state clear skipped during sign-out", e)
             } finally {
-                firebaseAuth?.signOut()
+                firebaseAuth.signOut()
             }
         }
     }
 
     private suspend fun executeCredentialSignIn(
-        activityContext: Context,
+        activity: Activity,
         request: GetCredentialRequest,
         suppressNoCredentialError: Boolean
     ): AuthActionResult {
-        val auth = firebaseAuth
-            ?: return AuthActionResult.Error(
-                "Firebase is not configured in this build. Ensure app/google-services.json is included and rebuild."
-            )
-
         return try {
-            val credentialManager = CredentialManager.create(activityContext)
+            val credentialManager = CredentialManager.create(activity)
             val response = credentialManager.getCredential(
-                context = activityContext,
+                context = activity,
                 request = request
             )
             val credential = response.credential
@@ -214,7 +214,7 @@ class AuthenticationProvider(
 
             val googleIdCredential = GoogleIdTokenCredential.createFrom(credential.data)
             val firebaseCredential = GoogleAuthProvider.getCredential(googleIdCredential.idToken, null)
-            val authResult = auth.signInWithCredential(firebaseCredential).await()
+            val authResult = firebaseAuth.signInWithCredential(firebaseCredential).await()
             val firebaseUser = authResult.user
                 ?: return AuthActionResult.Error("Sign-in succeeded, but no user profile was returned.")
 
@@ -224,10 +224,10 @@ class AuthenticationProvider(
                 isNewUser = isNewUser
             )
         } catch (e: GetCredentialCancellationException) {
-            Log.w(AUTH_TAG, "User cancelled Google Sign-In", e)
+            Log.w(AUTH_TAG, "Google Sign-In flow cancelled or dismissed: ${e.message}", e)
             AuthActionResult.Cancelled
         } catch (e: NoCredentialException) {
-            Log.w(AUTH_TAG, "No Google credential available on device", e)
+            Log.w(AUTH_TAG, "No Google credential available on device: ${e.message}", e)
             if (suppressNoCredentialError) {
                 AuthActionResult.Cancelled
             } else {
@@ -242,27 +242,29 @@ class AuthenticationProvider(
             Log.e(AUTH_TAG, "Firebase Authentication error (${e.errorCode})", e)
             AuthActionResult.Error(mapFirebaseAuthError(e))
         } catch (e: GetCredentialException) {
-            Log.e(AUTH_TAG, "Credential Manager error during Google Sign-In", e)
+            Log.e(AUTH_TAG, "Credential Manager error (${e.type}): ${e.errorMessage}", e)
+            val detail = e.errorMessage?.toString()?.takeIf { it.isNotBlank() }
             AuthActionResult.Error(
-                "Google Sign-In could not complete right now. Check your connection and try again."
+                detail ?: "Google Sign-In could not complete right now. Check your connection and try again."
             )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.e(AUTH_TAG, "Unexpected error during Google Sign-In", e)
-            AuthActionResult.Error("Sign-in failed unexpectedly. Please try again.")
+            AuthActionResult.Error(e.localizedMessage ?: "Sign-in failed unexpectedly. Please try again.")
         }
     }
 
     private fun resolveWebClientId(context: Context): String? {
         return runCatching {
-            val resId = context.resources.getIdentifier(
-                "default_web_client_id",
-                "string",
-                context.packageName
-            )
-            if (resId != 0) context.getString(resId).trim() else null
+            context.getString(R.string.default_web_client_id).trim()
         }.getOrNull()?.takeIf { it.isNotEmpty() }
+    }
+
+    private tailrec fun Context.findActivity(): Activity? = when (this) {
+        is Activity -> this
+        is ContextWrapper -> baseContext.findActivity()
+        else -> null
     }
 
     private fun mapFirebaseAuthError(e: FirebaseAuthException): String = when (e.errorCode) {
@@ -277,7 +279,7 @@ class AuthenticationProvider(
         "ERROR_TOO_MANY_REQUESTS" ->
             "Too many sign-in attempts. Please wait a moment and try again."
         else ->
-            "Authentication failed. Please try again."
+            "Authentication failed (${e.errorCode}). Please try again."
     }
 
     private fun FirebaseUser.toAuthenticatedAccount(): AuthenticatedAccount {
