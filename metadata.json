@@ -1,0 +1,6 @@
+{
+  "name": "WalX",
+  "description": "WalX by Nor Gaxmer Builds — Personal finance and money tracker with multi-wallet management, budgets, vaults, recurring bills, and Gemini AI Copilot.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
