@@ -23,26 +23,30 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.rounded.AccountBalanceWallet
-import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Email
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Person
-import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Shield
-import androidx.compose.material.icons.rounded.VerifiedUser
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,18 +54,21 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.domain.CurrencyCode
+import com.example.domain.PasswordHasher
 import com.example.ui.components.StatusPill
 import com.example.ui.components.WalXBrandLockup
 import com.example.ui.components.WalXCard
@@ -69,47 +76,117 @@ import com.example.ui.theme.LocalWalXColors
 
 @Composable
 fun AuthScreen(
+    hasRegisteredAccounts: Boolean,
     authError: String?,
     authBusy: Boolean,
+    securityError: String?,
     onClearError: () -> Unit,
-    onAttemptAutoSignIn: () -> Unit,
-    onContinueWithGoogle: (
-        preferredDisplayName: String?,
-        startingCurrency: CurrencyCode,
+    onClearSecurityError: () -> Unit,
+    onLogIn: (email: String, password: String, rememberMe: Boolean) -> Unit,
+    onSignUp: (
+        fullName: String,
+        email: String,
+        password: String,
+        confirmPassword: String,
+        resetPin: String,
+        currency: CurrencyCode,
         startingBalance: Double
+    ) -> Unit,
+    onResetPassword: (
+        email: String,
+        pin: String,
+        newPass: String,
+        confirmNewPass: String,
+        onSuccess: () -> Unit
     ) -> Unit
 ) {
     val extended = LocalWalXColors.current
     val focusManager = LocalFocusManager.current
 
-    var isSignUpTab by rememberSaveable { mutableStateOf(false) }
-    var displayName by rememberSaveable { mutableStateOf("") }
+    // Default to Create Account when no local account exists yet; otherwise Log In
+    var isSignUpTab by rememberSaveable(hasRegisteredAccounts) {
+        mutableStateOf(!hasRegisteredAccounts)
+    }
+
+    var emailInput by rememberSaveable { mutableStateOf("") }
+
+    // Login state
+    var loginPassword by remember { mutableStateOf("") }
+    var loginShowPass by remember { mutableStateOf(false) }
+    var rememberMe by rememberSaveable { mutableStateOf(true) }
+
+    // Sign-up state
+    var fullName by rememberSaveable { mutableStateOf("") }
+    var signUpPassword by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
+    var resetPin by remember { mutableStateOf("") }
+    var signUpShowPass by remember { mutableStateOf(false) }
     var startingCurrency by remember { mutableStateOf(CurrencyCode.INR) }
     var startingBalanceText by rememberSaveable { mutableStateOf("") }
+
     var localError by remember { mutableStateOf<String?>(null) }
     val displayError = localError ?: authError
 
-    LaunchedEffect(Unit) {
-        onAttemptAutoSignIn()
+    var showResetDialog by remember { mutableStateOf(false) }
+
+    fun submitLogin() {
+        focusManager.clearFocus()
+        val cleanEmail = emailInput.trim()
+        if (cleanEmail.isEmpty()) {
+            localError = "Please enter your email address."
+            return
+        }
+        if (loginPassword.isEmpty()) {
+            localError = "Please enter your password."
+            return
+        }
+        localError = null
+        onLogIn(cleanEmail, loginPassword, rememberMe)
     }
 
-    fun launchSignUpWithGoogle() {
+    fun submitSignUp() {
         focusManager.clearFocus()
-        val parsedBalance = if (startingBalanceText.isBlank()) {
+        val cleanName = fullName.trim()
+        val cleanEmail = emailInput.trim()
+        val cleanPin = resetPin.trim()
+        if (cleanName.length < 2) {
+            localError = "Please enter your full name (at least 2 characters)."
+            return
+        }
+        if (cleanEmail.isEmpty() || !cleanEmail.contains("@")) {
+            localError = "Please enter a valid email address."
+            return
+        }
+        if (signUpPassword.length < 6) {
+            localError = "Password must be at least 6 characters."
+            return
+        }
+        if (signUpPassword != confirmPassword) {
+            localError = "Passwords do not match."
+            return
+        }
+        if (cleanPin.length < 4) {
+            localError = "Recovery PIN must be at least 4 characters (used for Forgot Password)."
+            return
+        }
+        val startingBal = if (startingBalanceText.isBlank()) {
             0.0
         } else {
             startingBalanceText.trim().replace(",", "").toDoubleOrNull()?.coerceAtLeast(0.0)
                 ?: run {
-                    localError = "Opening balance must be a valid positive number."
+                    localError = "Opening balance must be a valid number."
                     return
                 }
         }
         localError = null
-        onClearError()
-        onContinueWithGoogle(
-            displayName.trim().takeIf { it.length >= 2 },
+        onSignUp(
+            cleanName,
+            cleanEmail,
+            signUpPassword,
+            confirmPassword,
+            cleanPin,
             startingCurrency,
-            parsedBalance
+            startingBal
         )
     }
 
@@ -120,7 +197,7 @@ fun AuthScreen(
                 Brush.verticalGradient(
                     colors = listOf(
                         extended.canvas,
-                        extended.accentContainer.copy(alpha = 0.28f),
+                        extended.accentContainer.copy(alpha = 0.25f),
                         extended.canvas
                     )
                 )
@@ -154,15 +231,13 @@ fun AuthScreen(
                 StatusPill("Isolated Vaults", extended.transferContainer, extended.transfer)
             }
 
-            Spacer(modifier = Modifier.height(22.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
-            // Obsidian Firebase Auth Card
             WalXCard(
                 modifier = Modifier.fillMaxWidth(),
-                borderColor = extended.accent.copy(alpha = 0.30f),
+                borderColor = extended.accent.copy(alpha = 0.28f),
                 contentPadding = 18.dp
             ) {
-                // Segmented Auth Tab Toggle
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -203,7 +278,7 @@ fun AuthScreen(
                         color = extended.expenseContainer,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 14.dp)
+                            .padding(bottom = 12.dp)
                     ) {
                         Row(
                             modifier = Modifier.padding(12.dp),
@@ -227,57 +302,115 @@ fun AuthScreen(
                 }
 
                 if (!isSignUpTab) {
-                    // LOG IN WITH GOOGLE (FIREBASE AUTH)
-                    Text(
-                        text = "Welcome back to WalX",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Sign in with your Google account to unlock your isolated multi-wallet ledger, budgets, and AI Copilot.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = extended.textMuted
-                    )
+                    if (!hasRegisteredAccounts) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = extended.accentContainer.copy(alpha = 0.55f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 12.dp)
+                        ) {
+                            Text(
+                                text = "New to WalX? Switch to Create Account to set up your personal finance vault.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                    }
 
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    AuthFeatureRow(
-                        icon = Icons.Rounded.VerifiedUser,
-                        title = "Verified Firebase Session",
-                        subtitle = "One-tap Google Identity via Android Credential Manager.",
-                        tint = extended.accent
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    AuthFeatureRow(
-                        icon = Icons.Rounded.Lock,
-                        title = "Strict Per-User Sandboxing",
-                        subtitle = "Wallets, transactions, budgets, and vaults are isolated by UID.",
-                        tint = extended.income
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    AuthFeatureRow(
-                        icon = Icons.Rounded.AutoAwesome,
-                        title = "WalX AI Financial Copilot",
-                        subtitle = "Natural-language quick-log and live spending analysis.",
-                        tint = extended.transfer
-                    )
-
-                    Spacer(modifier = Modifier.height(20.dp))
-
-                    Button(
-                        onClick = {
+                    OutlinedTextField(
+                        value = emailInput,
+                        onValueChange = {
+                            emailInput = it
                             localError = null
                             onClearError()
-                            onContinueWithGoogle(null, CurrencyCode.INR, 0.0)
                         },
+                        label = { Text("Email Address") },
+                        leadingIcon = { Icon(Icons.Rounded.Email, contentDescription = null) },
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Email,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("login_email_input")
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = loginPassword,
+                        onValueChange = {
+                            loginPassword = it
+                            localError = null
+                            onClearError()
+                        },
+                        label = { Text("Password") },
+                        leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
+                        trailingIcon = {
+                            IconButton(onClick = { loginShowPass = !loginShowPass }) {
+                                Icon(
+                                    if (loginShowPass) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                    contentDescription = "Toggle password visibility"
+                                )
+                            }
+                        },
+                        visualTransformation = if (loginShowPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Done
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onDone = { submitLogin() }
+                        ),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("login_password_input")
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { rememberMe = !rememberMe }
+                        ) {
+                            Checkbox(
+                                checked = rememberMe,
+                                onCheckedChange = { rememberMe = it }
+                            )
+                            Text("Remember me", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        TextButton(
+                            onClick = {
+                                onClearSecurityError()
+                                showResetDialog = true
+                            },
+                            modifier = Modifier.testTag("forgot_password_button")
+                        ) {
+                            Text("Forgot Password?", color = extended.accent)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Button(
+                        onClick = { submitLogin() },
                         enabled = !authBusy,
                         colors = ButtonDefaults.buttonColors(containerColor = extended.accent),
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(54.dp)
-                            .testTag("google_signin_button")
+                            .height(52.dp)
+                            .testTag("login_submit_button")
                     ) {
                         if (authBusy) {
                             CircularProgressIndicator(
@@ -285,48 +418,15 @@ fun AuthScreen(
                                 color = Color.White,
                                 strokeWidth = 2.dp
                             )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "Signing in...",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White
-                            )
                         } else {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Rounded.Login,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "Continue with Google",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White
-                            )
+                            Text("Log In to WalX", style = MaterialTheme.typography.titleMedium, color = Color.White)
                         }
                     }
                 } else {
-                    // NEW ACCOUNT SETUP WITH GOOGLE (FIREBASE AUTH)
-                    Text(
-                        text = "Configure your new WalX vault",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Customize your starting preferences below, then link your Google account to initialize your private workspace.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = extended.textMuted
-                    )
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
                     OutlinedTextField(
-                        value = displayName,
-                        onValueChange = { displayName = it; localError = null; onClearError() },
-                        label = { Text("Display Name (Optional)") },
-                        placeholder = { Text("Defaults to your Google profile name") },
+                        value = fullName,
+                        onValueChange = { fullName = it; localError = null; onClearError() },
+                        label = { Text("Full Name") },
                         leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
                         keyboardOptions = KeyboardOptions(
                             capitalization = KeyboardCapitalization.Words,
@@ -340,9 +440,107 @@ fun AuthScreen(
                             .fillMaxWidth()
                             .testTag("signup_name_input")
                     )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = emailInput,
+                        onValueChange = { emailInput = it; localError = null; onClearError() },
+                        label = { Text("Email Address") },
+                        leadingIcon = { Icon(Icons.Rounded.Email, contentDescription = null) },
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Email,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("signup_email_input")
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = signUpPassword,
+                        onValueChange = { signUpPassword = it; localError = null; onClearError() },
+                        label = { Text("Password (min 6 characters)") },
+                        leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
+                        trailingIcon = {
+                            IconButton(onClick = { signUpShowPass = !signUpShowPass }) {
+                                Icon(
+                                    if (signUpShowPass) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                    contentDescription = "Toggle password visibility"
+                                )
+                            }
+                        },
+                        visualTransformation = if (signUpShowPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("signup_password_input")
+                    )
+
+                    if (signUpPassword.isNotEmpty()) {
+                        PasswordStrengthMeter(password = signUpPassword)
+                    }
 
                     Spacer(modifier = Modifier.height(10.dp))
+                    val passwordsMatch = confirmPassword.isNotEmpty() && signUpPassword == confirmPassword
+                    OutlinedTextField(
+                        value = confirmPassword,
+                        onValueChange = { confirmPassword = it; localError = null; onClearError() },
+                        label = { Text("Confirm Password") },
+                        leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
+                        trailingIcon = if (passwordsMatch) {
+                            {
+                                Icon(
+                                    Icons.Rounded.CheckCircle,
+                                    contentDescription = "Passwords match",
+                                    tint = extended.income
+                                )
+                            }
+                        } else null,
+                        isError = confirmPassword.isNotEmpty() && !passwordsMatch,
+                        visualTransformation = if (signUpShowPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("signup_confirm_password_input")
+                    )
 
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = resetPin,
+                        onValueChange = { resetPin = it; localError = null; onClearError() },
+                        label = { Text("Recovery PIN (4+ chars for Forgot Password)") },
+                        leadingIcon = { Icon(Icons.Rounded.Key, contentDescription = null) },
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Text,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("signup_pin_input")
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
                     OutlinedTextField(
                         value = startingBalanceText,
                         onValueChange = { startingBalanceText = it; localError = null; onClearError() },
@@ -354,7 +552,7 @@ fun AuthScreen(
                             imeAction = ImeAction.Done
                         ),
                         keyboardActions = KeyboardActions(
-                            onDone = { launchSignUpWithGoogle() }
+                            onDone = { submitSignUp() }
                         ),
                         singleLine = true,
                         modifier = Modifier
@@ -384,17 +582,16 @@ fun AuthScreen(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(18.dp))
-
+                    Spacer(modifier = Modifier.height(16.dp))
                     Button(
-                        onClick = { launchSignUpWithGoogle() },
+                        onClick = { submitSignUp() },
                         enabled = !authBusy,
                         colors = ButtonDefaults.buttonColors(containerColor = extended.accent),
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(54.dp)
-                            .testTag("google_signup_button")
+                            .height(52.dp)
+                            .testTag("signup_submit_button")
                     ) {
                         if (authBusy) {
                             CircularProgressIndicator(
@@ -402,25 +599,8 @@ fun AuthScreen(
                                 color = Color.White,
                                 strokeWidth = 2.dp
                             )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "Creating account...",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White
-                            )
                         } else {
-                            Icon(
-                                imageVector = Icons.Rounded.PersonAdd,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "Create Account with Google",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White
-                            )
+                            Text("Create WalX Account", style = MaterialTheme.typography.titleMedium, color = Color.White)
                         }
                     }
                 }
@@ -428,15 +608,10 @@ fun AuthScreen(
 
             Spacer(modifier = Modifier.height(18.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    Icons.Rounded.Shield,
-                    contentDescription = null,
-                    tint = extended.textMuted,
-                    modifier = Modifier.size(14.dp)
-                )
+                Icon(Icons.Rounded.Shield, contentDescription = null, tint = extended.textMuted, modifier = Modifier.size(14.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Firebase Auth • Google Identity • Isolated Per-User Vaults",
+                    text = "Salted PBKDF2 Auth • Recovery PIN • Isolated Vaults",
                     style = MaterialTheme.typography.bodySmall,
                     color = extended.textMuted
                 )
@@ -444,50 +619,66 @@ fun AuthScreen(
             Spacer(modifier = Modifier.height(24.dp))
         }
     }
+
+    if (showResetDialog) {
+        ForgotPasswordDialog(
+            initialEmail = emailInput,
+            lockEmail = false,
+            busy = authBusy,
+            error = securityError,
+            onClearError = onClearSecurityError,
+            onDismiss = {
+                showResetDialog = false
+                onClearSecurityError()
+            },
+            onReset = { email, pin, newPass, confirmNewPass ->
+                onResetPassword(email, pin, newPass, confirmNewPass) {
+                    emailInput = email.trim()
+                    loginPassword = ""
+                    showResetDialog = false
+                }
+            }
+        )
+    }
 }
 
 @Composable
-private fun AuthFeatureRow(
-    icon: ImageVector,
-    title: String,
-    subtitle: String,
-    tint: Color
-) {
+internal fun PasswordStrengthMeter(password: String) {
     val extended = LocalWalXColors.current
+    val strength = PasswordHasher.evaluatePasswordStrength(password)
+    val strengthLabel = when (strength) {
+        1 -> "Weak"
+        2 -> "Fair"
+        3 -> "Good"
+        else -> "Strong"
+    }
+    val strengthColor = when (strength) {
+        1 -> extended.expense
+        2 -> extended.warning
+        3 -> extended.transfer
+        else -> extended.income
+    }
+    Spacer(modifier = Modifier.height(6.dp))
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(extended.cardElevated, RoundedCornerShape(12.dp))
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Surface(
-            shape = RoundedCornerShape(10.dp),
-            color = tint.copy(alpha = 0.16f),
-            modifier = Modifier.size(36.dp)
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = tint,
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-        }
-        Spacer(modifier = Modifier.width(12.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = extended.textMuted
+        for (bar in 1..4) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(if (bar <= strength) strengthColor else extended.border)
             )
         }
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = strengthLabel,
+            style = MaterialTheme.typography.labelSmall,
+            color = strengthColor
+        )
     }
 }
 
@@ -515,4 +706,123 @@ private fun AuthTabButton(
             )
         }
     }
+}
+
+@Composable
+internal fun ForgotPasswordDialog(
+    initialEmail: String,
+    lockEmail: Boolean,
+    busy: Boolean,
+    error: String?,
+    onClearError: () -> Unit,
+    onDismiss: () -> Unit,
+    onReset: (email: String, pin: String, newPass: String, confirmNewPass: String) -> Unit
+) {
+    val extended = LocalWalXColors.current
+    var email by remember { mutableStateOf(initialEmail) }
+    var pin by remember { mutableStateOf("") }
+    var newPass by remember { mutableStateOf("") }
+    var confirmNewPass by remember { mutableStateOf("") }
+    var showPasswords by remember { mutableStateOf(false) }
+    var localErr by remember { mutableStateOf<String?>(null) }
+    val shownError = localErr ?: error
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Forgot Password") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Enter your account email and the Recovery PIN you set during registration to create a new password.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = extended.textMuted
+                )
+                if (shownError != null) {
+                    Text(
+                        text = shownError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = extended.expense,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it; localErr = null; onClearError() },
+                    label = { Text("Account Email") },
+                    enabled = !lockEmail,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("forgot_email_input")
+                )
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it; localErr = null; onClearError() },
+                    label = { Text("Recovery PIN") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("forgot_pin_input")
+                )
+                OutlinedTextField(
+                    value = newPass,
+                    onValueChange = { newPass = it; localErr = null; onClearError() },
+                    label = { Text("New Password (min 6 chars)") },
+                    trailingIcon = {
+                        IconButton(onClick = { showPasswords = !showPasswords }) {
+                            Icon(
+                                if (showPasswords) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                contentDescription = "Toggle password visibility"
+                            )
+                        }
+                    },
+                    visualTransformation = if (showPasswords) VisualTransformation.None else PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("forgot_new_password_input")
+                )
+                if (newPass.isNotEmpty()) {
+                    PasswordStrengthMeter(password = newPass)
+                }
+                OutlinedTextField(
+                    value = confirmNewPass,
+                    onValueChange = { confirmNewPass = it; localErr = null; onClearError() },
+                    label = { Text("Confirm New Password") },
+                    visualTransformation = if (showPasswords) VisualTransformation.None else PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("forgot_confirm_password_input")
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (newPass.length < 6) {
+                        localErr = "New password must be at least 6 characters."
+                        return@Button
+                    }
+                    if (newPass != confirmNewPass) {
+                        localErr = "New passwords do not match."
+                        return@Button
+                    }
+                    onReset(email, pin, newPass, confirmNewPass)
+                },
+                enabled = !busy,
+                modifier = Modifier.testTag("forgot_submit_button")
+            ) {
+                if (busy) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
+                } else {
+                    Text("Reset Password")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }

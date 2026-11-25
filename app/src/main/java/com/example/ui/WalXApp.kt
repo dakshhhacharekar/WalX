@@ -164,18 +164,15 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                     ) { innerPadding ->
                         Box(modifier = Modifier.padding(innerPadding)) {
                             AuthScreen(
+                                hasRegisteredAccounts = state.hasRegisteredAccounts,
                                 authError = state.authError,
                                 authBusy = state.authBusy,
+                                securityError = state.securityError,
                                 onClearError = viewModel::clearAuthError,
-                                onAttemptAutoSignIn = { viewModel.attemptAutoSignInIfEligible(context) },
-                                onContinueWithGoogle = { name, currency, openingBalance ->
-                                    viewModel.signInWithGoogle(
-                                        activityContext = context,
-                                        preferredDisplayName = name,
-                                        startingCurrency = currency,
-                                        startingBalance = openingBalance
-                                    )
-                                }
+                                onClearSecurityError = viewModel::clearSecurityError,
+                                onLogIn = viewModel::logIn,
+                                onSignUp = viewModel::signUp,
+                                onResetPassword = viewModel::resetPasswordWithPin
                             )
                         }
                     }
@@ -268,7 +265,7 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                                             user = user,
                                             state = state,
                                             onToggleTheme = viewModel::toggleDarkMode,
-                                            onSignOut = { viewModel.signOut(context) },
+                                            onSignOut = viewModel::signOut,
                                             onQuickAddTransaction = viewModel::openNewTransactionModal,
                                             onInspectWallet = viewModel::inspectWalletInLedger,
                                             onSelectCashflowRange = viewModel::setCashflowRange,
@@ -328,7 +325,13 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
 
                                         WalXTab.SETTINGS -> SettingsScreen(
                                             user = user,
+                                            securityBusy = state.authBusy,
+                                            securityError = state.securityError,
+                                            onClearSecurityError = viewModel::clearSecurityError,
                                             onSaveProfile = viewModel::updateProfileSettings,
+                                            onChangePassword = viewModel::changePassword,
+                                            onResetPasswordWithPin = viewModel::resetPasswordWithPin,
+                                            onUpdateRecoveryPin = viewModel::updateRecoveryPin,
                                             onExportCsv = {
                                                 csvExportLauncher.launch("WalX_Ledger_${WalXDateUtils.todayIso()}.csv")
                                             },
@@ -345,7 +348,7 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                                                 }
                                             },
                                             onClearAllData = viewModel::clearAllUserData,
-                                            onSignOut = { viewModel.signOut(context) }
+                                            onSignOut = viewModel::signOut
                                         )
                                     }
                                 }

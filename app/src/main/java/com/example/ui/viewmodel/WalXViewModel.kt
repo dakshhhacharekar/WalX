@@ -1,14 +1,13 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
-import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.WalXAiCopilotService
-import com.example.auth.AuthActionResult
 import com.example.auth.AuthSessionEvent
 import com.example.auth.AuthenticationProvider
+import com.example.data.AuthResult
 import com.example.data.BackupExportManager
 import com.example.data.SessionManager
 import com.example.data.UserExportSnapshot
@@ -88,8 +87,10 @@ data class WalXUiState(
     val authState: AuthUiState = AuthUiState.Checking,
     val activeTab: WalXTab = WalXTab.DASHBOARD,
     val darkMode: Boolean = true,
+    val hasRegisteredAccounts: Boolean = false,
     val authError: String? = null,
     val authBusy: Boolean = false,
+    val securityError: String? = null,
     val wallets: List<Wallet> = emptyList(),
     val categories: List<Category> = emptyList(),
     val transactions: List<FinanceTransaction> = emptyList(),
@@ -114,12 +115,6 @@ data class WalXUiState(
     val bannerMessage: String? = null
 )
 
-private data class PendingOnboardingPrefs(
-    val displayName: String? = null,
-    val currency: CurrencyCode = CurrencyCode.INR,
-    val startingBalance: Double = 0.0
-)
-
 private const val VM_TAG = "WalXViewModel"
 
 class WalXViewModel(application: Application) : AndroidViewModel(application) {
@@ -127,7 +122,7 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
     private val database = WalXDatabase.getInstance(application)
     private val sessionManager = SessionManager(application)
     private val repository = WalXRepository(database, sessionManager)
-    private val authProvider = AuthenticationProvider()
+    private val authProvider = AuthenticationProvider(repository)
     private val aiCopilot = WalXAiCopilotService()
 
     private val _uiState = MutableStateFlow(WalXUiState())
@@ -135,9 +130,6 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
 
     private var userDataJob: Job? = null
     private var aiInsightsJob: Job? = null
-    private var autoSignInAttempted = false
-    private var suppressAutoSignIn = false
-    private var pendingOnboardingPrefs: PendingOnboardingPrefs? = null
 
     init {
         viewModelScope.launch {
@@ -147,28 +139,26 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
-            repository.purgeLegacyDemoAccountIfPresent()
-            authProvider.observeAuthState().collect { event ->
+            authProvider.authState.collect { event ->
                 when (event) {
+                    AuthSessionEvent.Checking -> {
+                        _uiState.update { it.copy(authState = AuthUiState.Checking) }
+                    }
+
                     is AuthSessionEvent.Authenticated -> {
-                        val prefs = pendingOnboardingPrefs
-                        pendingOnboardingPrefs = null
-                        val profile = repository.ensureFirebaseUserWorkspace(
-                            account = event.account,
-                            preferredDisplayName = prefs?.displayName,
-                            preferredCurrency = prefs?.currency ?: CurrencyCode.INR,
-                            startingBalance = prefs?.startingBalance ?: 0.0
-                        )
-                        startObservingUser(profile)
+                        _uiState.update { it.copy(hasRegisteredAccounts = true) }
+                        startObservingUser(event.user)
                     }
 
                     AuthSessionEvent.Unauthenticated -> {
                         userDataJob?.cancel()
                         aiInsightsJob?.cancel()
+                        val hasAccounts = repository.hasRegisteredAccounts()
                         _uiState.update { state ->
                             WalXUiState(
                                 authState = AuthUiState.Unauthenticated,
                                 darkMode = state.darkMode,
+                                hasRegisteredAccounts = hasAccounts,
                                 authBusy = authProvider.isLoading.value,
                                 authError = state.authError,
                                 bannerMessage = state.bannerMessage
@@ -177,6 +167,11 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
+        }
+
+        viewModelScope.launch {
+            val hasAccounts = authProvider.restoreSession()
+            _uiState.update { it.copy(hasRegisteredAccounts = hasAccounts) }
         }
     }
 
@@ -244,90 +239,158 @@ class WalXViewModel(application: Application) : AndroidViewModel(application) {
     private fun activeUserId(): String? =
         (_uiState.value.authState as? AuthUiState.Authenticated)?.user?.id
 
-    // --- Firebase Authentication via AuthenticationProvider ---
+    // --- Email & Password Authentication via AuthenticationProvider ---
 
     fun clearAuthError() {
         _uiState.update { it.copy(authError = null) }
     }
 
-    fun attemptAutoSignInIfEligible(activityContext: Context) {
-        if (autoSignInAttempted || suppressAutoSignIn) return
-        if (_uiState.value.authState !is AuthUiState.Unauthenticated || authProvider.isLoading.value) return
-        autoSignInAttempted = true
+    fun clearSecurityError() {
+        _uiState.update { it.copy(securityError = null) }
+    }
 
+    fun logIn(email: String, password: String, rememberMe: Boolean) {
+        if (authProvider.isLoading.value) return
         viewModelScope.launch {
             _uiState.update { it.copy(authError = null) }
-            when (val result = authProvider.attemptAutoSignIn(activityContext)) {
-                is AuthActionResult.Success -> {
-                    _uiState.update { it.copy(authError = null) }
+            when (val res = authProvider.logIn(email, password, rememberMe)) {
+                is AuthResult.Success -> {
+                    _uiState.update { it.copy(hasRegisteredAccounts = true, authError = null) }
                 }
-
-                AuthActionResult.Cancelled -> Unit
-
-                is AuthActionResult.Error -> {
-                    _uiState.update { it.copy(authError = result.message) }
+                is AuthResult.Error -> {
+                    _uiState.update { it.copy(authError = res.message) }
                 }
             }
         }
     }
 
-    fun signInWithGoogle(
-        activityContext: Context,
-        preferredDisplayName: String? = null,
-        startingCurrency: CurrencyCode = CurrencyCode.INR,
+    fun signUp(
+        fullName: String,
+        email: String,
+        password: String,
+        confirmPassword: String,
+        resetPin: String,
+        currency: CurrencyCode,
         startingBalance: Double = 0.0
     ) {
         if (authProvider.isLoading.value) return
-        suppressAutoSignIn = false
-        pendingOnboardingPrefs = PendingOnboardingPrefs(
-            displayName = preferredDisplayName?.trim()?.takeIf { it.length >= 2 },
-            currency = startingCurrency,
-            startingBalance = FinanceMath.roundCurrency(startingBalance.coerceAtLeast(0.0))
-        )
-
         viewModelScope.launch {
             _uiState.update { it.copy(authError = null) }
-            when (val result = authProvider.signInWithGoogle(activityContext)) {
-                is AuthActionResult.Success -> {
-                    val welcome = if (result.isNewUser) {
-                        "Welcome to WalX, ${result.account.displayName}!"
-                    } else {
-                        "Signed in as ${result.account.displayName}."
+            when (
+                val res = authProvider.signUp(
+                    fullName = fullName,
+                    email = email,
+                    password = password,
+                    confirmPassword = confirmPassword,
+                    resetPin = resetPin,
+                    currency = currency,
+                    startingBalance = startingBalance
+                )
+            ) {
+                is AuthResult.Success -> {
+                    _uiState.update {
+                        it.copy(
+                            hasRegisteredAccounts = true,
+                            authError = null,
+                            bannerMessage = "Welcome to WalX, ${res.user.fullName}!"
+                        )
                     }
-                    _uiState.update { it.copy(authError = null, bannerMessage = welcome) }
                 }
-
-                AuthActionResult.Cancelled -> {
-                    pendingOnboardingPrefs = null
-                    _uiState.update { it.copy(authBusy = false) }
-                }
-
-                is AuthActionResult.Error -> {
-                    pendingOnboardingPrefs = null
-                    _uiState.update { it.copy(authBusy = false, authError = result.message) }
+                is AuthResult.Error -> {
+                    _uiState.update { it.copy(authError = res.message) }
                 }
             }
         }
     }
 
-    fun signOut(context: Context) {
-        suppressAutoSignIn = true
-        pendingOnboardingPrefs = null
+    fun resetPasswordWithPin(
+        email: String,
+        resetPin: String,
+        newPassword: String,
+        confirmNewPassword: String,
+        onSuccess: () -> Unit
+    ) {
+        if (authProvider.isLoading.value) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(securityError = null) }
+            when (
+                val res = authProvider.resetPasswordWithPin(
+                    email = email,
+                    resetPin = resetPin,
+                    newPassword = newPassword,
+                    confirmNewPassword = confirmNewPassword
+                )
+            ) {
+                is AuthResult.Success -> {
+                    _uiState.update { it.copy(securityError = null) }
+                    showBanner("Password reset for ${res.user.email}.")
+                    onSuccess()
+                }
+                is AuthResult.Error -> {
+                    _uiState.update { it.copy(securityError = res.message) }
+                }
+            }
+        }
+    }
+
+    fun changePassword(
+        currentPassword: String,
+        newPassword: String,
+        confirmNewPassword: String,
+        onSuccess: () -> Unit
+    ) {
+        val uid = activeUserId() ?: return
+        if (authProvider.isLoading.value) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(securityError = null) }
+            when (
+                val res = authProvider.changePassword(
+                    userId = uid,
+                    currentPassword = currentPassword,
+                    newPassword = newPassword,
+                    confirmNewPassword = confirmNewPassword
+                )
+            ) {
+                is AuthResult.Success -> {
+                    _uiState.update { it.copy(securityError = null) }
+                    showBanner("Password updated successfully.")
+                    onSuccess()
+                }
+                is AuthResult.Error -> {
+                    _uiState.update { it.copy(securityError = res.message) }
+                }
+            }
+        }
+    }
+
+    fun updateRecoveryPin(
+        currentPassword: String,
+        newPin: String,
+        onSuccess: () -> Unit
+    ) {
+        val uid = activeUserId() ?: return
+        if (authProvider.isLoading.value) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(securityError = null) }
+            when (val res = authProvider.updateRecoveryPin(uid, currentPassword, newPin)) {
+                is AuthResult.Success -> {
+                    _uiState.update { it.copy(securityError = null) }
+                    showBanner("Recovery PIN updated successfully.")
+                    onSuccess()
+                }
+                is AuthResult.Error -> {
+                    _uiState.update { it.copy(securityError = res.message) }
+                }
+            }
+        }
+    }
+
+    fun signOut() {
         userDataJob?.cancel()
         aiInsightsJob?.cancel()
-
         viewModelScope.launch {
-            authProvider.signOut(
-                context = context,
-                onClearLocalState = { repository.clearLocalSessionMarker() }
-            )
-            _uiState.update { state ->
-                WalXUiState(
-                    authState = AuthUiState.Unauthenticated,
-                    darkMode = state.darkMode,
-                    bannerMessage = "Signed out cleanly."
-                )
-            }
+            authProvider.signOut()
+            showBanner("Signed out cleanly.")
         }
     }
 

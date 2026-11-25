@@ -1,357 +1,196 @@
 package com.example.auth
 
-import android.app.Activity
-import android.content.Context
-import android.content.ContextWrapper
-import android.util.Log
-import androidx.credentials.ClearCredentialStateRequest
-import androidx.credentials.CredentialManager
-import androidx.credentials.CustomCredential
-import androidx.credentials.GetCredentialRequest
-import androidx.credentials.exceptions.ClearCredentialException
-import androidx.credentials.exceptions.GetCredentialCancellationException
-import androidx.credentials.exceptions.GetCredentialException
-import androidx.credentials.exceptions.NoCredentialException
-import com.example.R
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
-import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
-import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
-import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
-import com.google.firebase.Firebase
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.auth.FirebaseAuthException
-import com.google.firebase.auth.FirebaseUser
-import com.google.firebase.auth.GoogleAuthProvider
-import com.google.firebase.auth.auth
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.flow.Flow
+import com.example.data.AuthResult
+import com.example.data.WalXRepository
+import com.example.domain.CurrencyCode
+import com.example.domain.UserProfile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
 
 /**
- * Normalized identity snapshot for a Firebase-authenticated user session.
- */
-data class AuthenticatedAccount(
-    val uid: String,
-    val displayName: String,
-    val email: String,
-    val photoUrl: String? = null
-)
-
-/**
- * Reactive session stream events emitted by [AuthenticationProvider.observeAuthState].
+ * Reactive session state managed by [AuthenticationProvider].
  */
 sealed interface AuthSessionEvent {
+    data object Checking : AuthSessionEvent
     data object Unauthenticated : AuthSessionEvent
-    data class Authenticated(val account: AuthenticatedAccount) : AuthSessionEvent
+    data class Authenticated(val user: UserProfile) : AuthSessionEvent
 }
 
 /**
- * Outcome of an interactive or silent authentication attempt.
- */
-sealed interface AuthActionResult {
-    data class Success(
-        val account: AuthenticatedAccount,
-        val isNewUser: Boolean
-    ) : AuthActionResult
-
-    data object Cancelled : AuthActionResult
-    data class Error(val message: String) : AuthActionResult
-}
-
-private const val AUTH_TAG = "Auth"
-
-/**
- * Core Firebase Authentication provider for WalX.
+ * Core Email & Password Authentication provider for WalX.
  *
- * Manages user sessions, silent auto sign-in for returning users, interactive Google Sign-In /
- * Sign-Up via Jetpack Credential Manager, and leak-free session teardown on sign-out.
- *
- * Resolves the Web Client ID strictly from [R.string.default_web_client_id], which is
- * auto-generated at build time by the Google Services Gradle plugin from `app/google-services.json`.
+ * Uses salted PBKDF2-HMAC-SHA256 credential hashing, Recovery PIN password resets,
+ * per-user isolated vaults, reactive loading state ([isLoading]), and clean session termination.
  */
 class AuthenticationProvider(
-    private val firebaseAuth: FirebaseAuth = Firebase.auth
+    private val repository: WalXRepository
 ) {
     private val _isLoading = MutableStateFlow(false)
 
     /**
-     * Reactive loading state emitted while a Google Sign-In, auto sign-in, or sign-out
-     * operation is executing so the UI can show progress indicators and prevent duplicate taps.
+     * Reactive loading indicator emitted while login, sign-up, password reset, or sign-out
+     * operations are executing so the UI shows visual feedback and blocks duplicate requests.
      */
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
-    private val _authState = MutableStateFlow<AuthSessionEvent>(
-        firebaseAuth.currentUser?.let { AuthSessionEvent.Authenticated(it.toAuthenticatedAccount()) }
-            ?: AuthSessionEvent.Unauthenticated
-    )
+    private val _authState = MutableStateFlow<AuthSessionEvent>(AuthSessionEvent.Checking)
 
     /**
-     * Local snapshot of the current authentication session, updated immediately on sign-out
-     * and kept in sync with Firebase Auth state transitions.
+     * Reactive session stream driving authenticated vs unauthenticated UI routing.
      */
     val authState: StateFlow<AuthSessionEvent> = _authState.asStateFlow()
 
-    @Volatile
-    private var requireInteractiveSelection: Boolean = false
+    val currentUser: UserProfile?
+        get() = (_authState.value as? AuthSessionEvent.Authenticated)?.user
 
-    /**
-     * Current signed-in Firebase account, or null if unauthenticated.
-     */
-    val currentAccount: AuthenticatedAccount?
-        get() = firebaseAuth.currentUser?.toAuthenticatedAccount()
-
-    /**
-     * Returns the verified Firebase UID for the current session, or throws if unauthenticated.
-     */
     fun requireUserId(): String =
-        firebaseAuth.currentUser?.uid
-            ?: throw IllegalStateException("User must be signed in to access WalX data.")
+        currentUser?.id ?: throw IllegalStateException("User must be signed in to access WalX data.")
 
     /**
-     * Cold flow observing Firebase Auth session transitions across login, account switch,
-     * token refresh, and sign-out.
+     * Initializes the session on app launch, purging any legacy demo records and restoring a
+     * remembered user session if present.
      */
-    fun observeAuthState(): Flow<AuthSessionEvent> = callbackFlow {
-        val listener = FirebaseAuth.AuthStateListener { state ->
-            val user = state.currentUser
-            val event = if (user != null) {
-                AuthSessionEvent.Authenticated(user.toAuthenticatedAccount())
-            } else {
-                AuthSessionEvent.Unauthenticated
-            }
-            _authState.value = event
-            trySend(event)
-        }
-        firebaseAuth.addAuthStateListener(listener)
-        awaitClose {
-            firebaseAuth.removeAuthStateListener(listener)
-        }
-    }.distinctUntilChanged()
-
-    /**
-     * Attempts silent returning-user sign-in using previously authorized Google credentials.
-     *
-     * Skipped automatically after an explicit [signOut] so Credential Manager prompts the user
-     * to choose an account interactively instead of silently re-authenticating the previous session.
-     */
-    suspend fun attemptAutoSignIn(activityContext: Context): AuthActionResult {
-        if (requireInteractiveSelection) {
-            return AuthActionResult.Cancelled
-        }
-
-        val existing = currentAccount
-        if (existing != null) {
-            return AuthActionResult.Success(account = existing, isNewUser = false)
-        }
-
-        val activity = activityContext.findActivity() ?: return AuthActionResult.Cancelled
-        val webClientId = resolveWebClientId(activity) ?: return AuthActionResult.Cancelled
-
-        val googleIdOption = GetGoogleIdOption.Builder()
-            .setFilterByAuthorizedAccounts(true)
-            .setServerClientId(webClientId)
-            .setAutoSelectEnabled(true)
-            .build()
-
-        val request = GetCredentialRequest.Builder()
-            .addCredentialOption(googleIdOption)
-            .build()
-
-        return executeCredentialSignIn(
-            activity = activity,
-            request = request,
-            suppressNoCredentialError = true
-        )
-    }
-
-    /**
-     * Launches the interactive Google Sign-In / Sign-Up flow via Jetpack Credential Manager.
-     *
-     * Uses a single [GetSignInWithGoogleOption] per [GetCredentialRequest] so new and returning
-     * users can select or create their Google-backed WalX session reliably.
-     */
-    suspend fun signInWithGoogle(activityContext: Context): AuthActionResult {
-        val activity = activityContext.findActivity()
-            ?: return AuthActionResult.Error(
-                "Unable to launch Google Sign-In from the current screen. Please reopen WalX and try again."
-            )
-
-        val webClientId = resolveWebClientId(activity)
-            ?: return AuthActionResult.Error(
-                "Google Sign-In configuration missing: default_web_client_id was not generated from google-services.json."
-            )
-
-        val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = webClientId)
-            .build()
-
-        val request = GetCredentialRequest.Builder()
-            .addCredentialOption(signInOption)
-            .build()
-
-        return executeCredentialSignIn(
-            activity = activity,
-            request = request,
-            suppressNoCredentialError = false
-        )
-    }
-
-    /**
-     * Terminates the active session cleanly:
-     * 1. Marks interactive selection as required so silent auto-login is suppressed.
-     * 2. Clears any caller-managed local auth/session markers via [onClearLocalState].
-     * 3. Clears Jetpack Credential Manager state ([ClearCredentialStateRequest]) so the next
-     *    sign-in prompts for Google account selection again.
-     * 4. Signs out of Firebase Auth and resets local [authState] to [AuthSessionEvent.Unauthenticated].
-     *
-     * Runs inside [NonCancellable] so rapid UI unmount or scope cancellation cannot interrupt teardown.
-     */
-    suspend fun signOut(
-        context: Context,
-        onClearLocalState: (suspend () -> Unit)? = null
-    ) {
+    suspend fun restoreSession(): Boolean {
         _isLoading.value = true
-        requireInteractiveSelection = true
-        try {
-            withContext(NonCancellable) {
-                try {
-                    onClearLocalState?.invoke()
-                } catch (e: Exception) {
-                    Log.w(AUTH_TAG, "Local session cleanup threw during sign-out", e)
-                }
-
-                try {
-                    val credentialManager = CredentialManager.create(context)
-                    credentialManager.clearCredentialState(ClearCredentialStateRequest())
-                } catch (e: ClearCredentialException) {
-                    Log.w(AUTH_TAG, "Failed to clear Credential Manager state: ${e.errorMessage}", e)
-                } catch (e: Exception) {
-                    Log.w(AUTH_TAG, "Credential state clear skipped during sign-out", e)
-                } finally {
-                    firebaseAuth.signOut()
-                    _authState.value = AuthSessionEvent.Unauthenticated
-                }
-            }
-        } finally {
-            _isLoading.value = false
-        }
-    }
-
-    private suspend fun executeCredentialSignIn(
-        activity: Activity,
-        request: GetCredentialRequest,
-        suppressNoCredentialError: Boolean
-    ): AuthActionResult {
-        if (!_isLoading.compareAndSet(expect = false, update = true)) {
-            return AuthActionResult.Cancelled
-        }
-
         return try {
-            val credentialManager = CredentialManager.create(activity)
-            val response = credentialManager.getCredential(
-                context = activity,
-                request = request
-            )
-            val credential = response.credential
-            if (credential !is CustomCredential ||
-                credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
-            ) {
-                Log.w(AUTH_TAG, "Unexpected credential type returned: ${credential.type}")
-                return AuthActionResult.Error("Unsupported sign-in credential received. Please try again.")
-            }
-
-            val googleIdCredential = GoogleIdTokenCredential.createFrom(credential.data)
-            val firebaseCredential = GoogleAuthProvider.getCredential(googleIdCredential.idToken, null)
-            val authResult = firebaseAuth.signInWithCredential(firebaseCredential).await()
-            val firebaseUser = authResult.user
-                ?: return AuthActionResult.Error("Sign-in succeeded, but no user profile was returned.")
-
-            val account = firebaseUser.toAuthenticatedAccount()
-            requireInteractiveSelection = false
-            _authState.value = AuthSessionEvent.Authenticated(account)
-
-            val isNewUser = authResult.additionalUserInfo?.isNewUser == true
-            AuthActionResult.Success(
-                account = account,
-                isNewUser = isNewUser
-            )
-        } catch (e: GetCredentialCancellationException) {
-            Log.w(AUTH_TAG, "Google Sign-In flow cancelled or dismissed: ${e.message}", e)
-            AuthActionResult.Cancelled
-        } catch (e: NoCredentialException) {
-            Log.w(AUTH_TAG, "No Google credential available on device: ${e.message}", e)
-            if (suppressNoCredentialError) {
-                AuthActionResult.Cancelled
+            repository.purgeLegacyDemoAccountIfPresent()
+            val hasAccounts = repository.hasRegisteredAccounts()
+            val remembered = repository.getRememberedUser()
+            if (remembered != null) {
+                _authState.value = AuthSessionEvent.Authenticated(remembered)
             } else {
-                AuthActionResult.Error(
-                    "No Google account is available on this device. Please add a Google account in device settings."
-                )
+                _authState.value = AuthSessionEvent.Unauthenticated
             }
-        } catch (e: GoogleIdTokenParsingException) {
-            Log.e(AUTH_TAG, "Failed to parse Google ID token", e)
-            AuthActionResult.Error("Could not verify Google account token. Please try again.")
-        } catch (e: FirebaseAuthException) {
-            Log.e(AUTH_TAG, "Firebase Authentication error (${e.errorCode})", e)
-            AuthActionResult.Error(mapFirebaseAuthError(e))
-        } catch (e: GetCredentialException) {
-            Log.e(AUTH_TAG, "Credential Manager error (${e.type}): ${e.errorMessage}", e)
-            val detail = e.errorMessage?.toString()?.takeIf { it.isNotBlank() }
-            AuthActionResult.Error(
-                detail ?: "Google Sign-In could not complete right now. Check your connection and try again."
-            )
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(AUTH_TAG, "Unexpected error during Google Sign-In", e)
-            AuthActionResult.Error(e.localizedMessage ?: "Sign-in failed unexpectedly. Please try again.")
+            hasAccounts
         } finally {
             _isLoading.value = false
         }
     }
 
-    private fun resolveWebClientId(context: Context): String? {
-        return runCatching {
-            context.getString(R.string.default_web_client_id).trim()
-        }.getOrNull()?.takeIf { it.isNotEmpty() }
+    suspend fun signUp(
+        fullName: String,
+        email: String,
+        password: String,
+        confirmPassword: String,
+        resetPin: String,
+        currency: CurrencyCode,
+        startingBalance: Double = 0.0
+    ): AuthResult {
+        if (password != confirmPassword) {
+            return AuthResult.Error("Passwords do not match.")
+        }
+        if (!_isLoading.compareAndSet(expect = false, update = true)) {
+            return AuthResult.Error("Another authentication request is already in progress.")
+        }
+        return try {
+            val result = repository.signUp(
+                fullName = fullName,
+                email = email,
+                password = password,
+                resetPin = resetPin,
+                currency = currency,
+                startingBalance = startingBalance
+            )
+            if (result is AuthResult.Success) {
+                _authState.value = AuthSessionEvent.Authenticated(result.user)
+            }
+            result
+        } finally {
+            _isLoading.value = false
+        }
     }
 
-    private tailrec fun Context.findActivity(): Activity? = when (this) {
-        is Activity -> this
-        is ContextWrapper -> baseContext.findActivity()
-        else -> null
+    suspend fun logIn(email: String, password: String, rememberMe: Boolean): AuthResult {
+        if (!_isLoading.compareAndSet(expect = false, update = true)) {
+            return AuthResult.Error("Another authentication request is already in progress.")
+        }
+        return try {
+            val result = repository.logIn(email = email, password = password, rememberMe = rememberMe)
+            if (result is AuthResult.Success) {
+                _authState.value = AuthSessionEvent.Authenticated(result.user)
+            }
+            result
+        } finally {
+            _isLoading.value = false
+        }
     }
 
-    private fun mapFirebaseAuthError(e: FirebaseAuthException): String = when (e.errorCode) {
-        "ERROR_ACCOUNT_EXISTS_WITH_DIFFERENT_CREDENTIAL" ->
-            "An account already exists with a different sign-in method."
-        "ERROR_USER_DISABLED" ->
-            "This account has been disabled. Contact support for assistance."
-        "ERROR_INVALID_CREDENTIAL" ->
-            "Your Google sign-in token expired or is invalid. Please try again."
-        "ERROR_NETWORK_REQUEST_FAILED" ->
-            "Network error while contacting authentication servers. Check your internet connection."
-        "ERROR_TOO_MANY_REQUESTS" ->
-            "Too many sign-in attempts. Please wait a moment and try again."
-        else ->
-            "Authentication failed (${e.errorCode}). Please try again."
+    suspend fun resetPasswordWithPin(
+        email: String,
+        resetPin: String,
+        newPassword: String,
+        confirmNewPassword: String
+    ): AuthResult {
+        if (newPassword != confirmNewPassword) {
+            return AuthResult.Error("New passwords do not match.")
+        }
+        if (!_isLoading.compareAndSet(expect = false, update = true)) {
+            return AuthResult.Error("Another security request is already in progress.")
+        }
+        return try {
+            repository.resetPasswordWithPin(
+                email = email,
+                resetPin = resetPin,
+                newPassword = newPassword
+            )
+        } finally {
+            _isLoading.value = false
+        }
     }
 
-    private fun FirebaseUser.toAuthenticatedAccount(): AuthenticatedAccount {
-        val cleanEmail = email?.trim().orEmpty()
-        val fallbackName = cleanEmail.substringBefore("@").ifBlank { "WalX Member" }
-        val cleanName = displayName?.trim().takeUnless { it.isNullOrBlank() } ?: fallbackName
-        return AuthenticatedAccount(
-            uid = uid,
-            displayName = cleanName,
-            email = cleanEmail,
-            photoUrl = photoUrl?.toString()
-        )
+    suspend fun changePassword(
+        userId: String,
+        currentPassword: String,
+        newPassword: String,
+        confirmNewPassword: String
+    ): AuthResult {
+        if (newPassword != confirmNewPassword) {
+            return AuthResult.Error("New passwords do not match.")
+        }
+        if (!_isLoading.compareAndSet(expect = false, update = true)) {
+            return AuthResult.Error("Another security request is already in progress.")
+        }
+        return try {
+            repository.changePassword(
+                userId = userId,
+                currentPassword = currentPassword,
+                newPassword = newPassword
+            )
+        } finally {
+            _isLoading.value = false
+        }
+    }
+
+    suspend fun updateRecoveryPin(
+        userId: String,
+        currentPassword: String,
+        newPin: String
+    ): AuthResult {
+        if (!_isLoading.compareAndSet(expect = false, update = true)) {
+            return AuthResult.Error("Another security request is already in progress.")
+        }
+        return try {
+            repository.updateRecoveryPin(
+                userId = userId,
+                currentPassword = currentPassword,
+                newPin = newPin
+            )
+        } finally {
+            _isLoading.value = false
+        }
+    }
+
+    /**
+     * Clears the remembered session marker and terminates the active authentication state cleanly.
+     */
+    suspend fun signOut() {
+        _isLoading.value = true
+        try {
+            repository.clearLocalSessionMarker()
+            _authState.value = AuthSessionEvent.Unauthenticated
+        } finally {
+            _isLoading.value = false
+        }
     }
 }
