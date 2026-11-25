@@ -1,12 +1,11 @@
 package com.example.data
 
-import android.database.sqlite.SQLiteConstraintException
 import androidx.room.withTransaction
+import com.example.auth.AuthenticatedAccount
 import com.example.domain.Category
 import com.example.domain.CurrencyCode
 import com.example.domain.FinanceMath
 import com.example.domain.FinanceTransaction
-import com.example.domain.PasswordHasher
 import com.example.domain.RecurringBill
 import com.example.domain.RecurringFrequency
 import com.example.domain.SavingsGoal
@@ -15,16 +14,9 @@ import com.example.domain.UserProfile
 import com.example.domain.WalXDateUtils
 import com.example.domain.Wallet
 import com.example.domain.WalletType
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.withContext
 import java.util.UUID
-
-sealed interface AuthResult {
-    data class Success(val user: UserProfile) : AuthResult
-    data class Error(val message: String) : AuthResult
-}
 
 class WalXRepository(
     private val db: WalXDatabase,
@@ -32,10 +24,11 @@ class WalXRepository(
 ) {
     private val dao = db.walXDao()
 
-    // --- Auth & Session ---
+    // --- Firebase Auth User Sandboxing & Workspace Provisioning ---
 
     /**
-     * Removes any leftover legacy demo account from earlier builds so only real user accounts exist.
+     * Removes any leftover legacy demo account from earlier builds so only real authenticated
+     * user accounts exist.
      */
     suspend fun purgeLegacyDemoAccountIfPresent() {
         val legacyId = DefaultAccountTemplates.LEGACY_DEMO_USER_ID
@@ -55,128 +48,92 @@ class WalXRepository(
         }
     }
 
-    suspend fun hasRegisteredAccounts(): Boolean = dao.getUserCount() > 0
-
-    suspend fun getRememberedUser(): UserProfile? {
-        val userId = sessionManager.getRememberedUserId() ?: return null
-        val user = dao.getUserById(userId)
-        if (user == null) {
-            sessionManager.clearSession()
-            return null
-        }
-        return user.toDomain()
-    }
-
-    suspend fun signUp(
-        fullName: String,
-        email: String,
-        password: String,
-        resetPin: String,
-        currency: CurrencyCode,
+    /**
+     * Ensures an isolated local WalX workspace exists for the verified Firebase [account].
+     *
+     * Every wallet, category, transaction, savings vault, and recurring bill is strictly scoped
+     * to [AuthenticatedAccount.uid] so switching accounts never leaks financial state.
+     * On first sign-in for a UID, provisions 12 default categories and a starter wallet using the
+     * user's chosen onboarding preferences.
+     */
+    suspend fun ensureFirebaseUserWorkspace(
+        account: AuthenticatedAccount,
+        preferredDisplayName: String? = null,
+        preferredCurrency: CurrencyCode = CurrencyCode.INR,
         startingBalance: Double = 0.0
-    ): AuthResult {
-        val cleanName = fullName.trim()
-        val cleanEmail = email.trim().lowercase()
-        val cleanPin = resetPin.trim()
+    ): UserProfile {
+        val uid = account.uid.trim()
+        require(uid.isNotEmpty()) { "Firebase UID must not be blank." }
 
-        if (cleanName.length < 2) return AuthResult.Error("Please enter your full name (at least 2 characters).")
-        if (!isValidEmail(cleanEmail)) return AuthResult.Error("Please enter a valid email address.")
-        if (password.length < 6) return AuthResult.Error("Password must be at least 6 characters.")
-        if (cleanPin.length < 4) return AuthResult.Error("Recovery PIN must be at least 4 characters.")
+        val cleanEmail = account.email.trim().lowercase().ifBlank { "$uid@walx.user" }
+        val resolvedName = preferredDisplayName?.trim()
+            ?.takeIf { it.length >= 2 }
+            ?: account.displayName.trim().ifBlank { "WalX Member" }
 
-        if (dao.getUserByEmail(cleanEmail) != null) {
-            return AuthResult.Error("An account with $cleanEmail already exists. Please log in instead.")
-        }
-
-        val userId = "usr_${UUID.randomUUID().toString().replace("-", "").take(12)}"
-        val (passHash, pinHash) = withContext(Dispatchers.Default) {
-            PasswordHasher.hash(password) to PasswordHasher.hash(cleanPin)
-        }
-        val defaultBudget = when (currency) {
-            CurrencyCode.INR -> 50000.0
-            CurrencyCode.JPY -> 200000.0
-            else -> 2500.0
-        }
-
-        val entity = UserEntity(
-            id = userId,
-            fullName = cleanName,
-            email = cleanEmail,
-            passwordHash = passHash.hashHex,
-            passwordSalt = passHash.saltHex,
-            resetPinHash = pinHash.hashHex,
-            resetPinSalt = pinHash.saltHex,
-            currencyCode = currency.code,
-            monthlyBudget = defaultBudget,
-            darkMode = true,
-            createdAt = System.currentTimeMillis()
-        )
-
-        return try {
-            db.withTransaction {
-                dao.insertUser(entity)
-                dao.upsertCategories(DefaultAccountTemplates.createDefaultCategories(userId))
-                dao.upsertWallet(
-                    DefaultAccountTemplates.createStarterWallet(
-                        userId = userId,
-                        initialBalance = FinanceMath.roundCurrency(startingBalance.coerceAtLeast(0.0))
-                    )
-                )
+        return db.withTransaction {
+            val existing = dao.getUserById(uid)
+            if (existing != null) {
+                val updatedName = existing.fullName.ifBlank { resolvedName }
+                val needsSync = existing.fullName != updatedName ||
+                    (cleanEmail != existing.email && dao.getUserByEmail(cleanEmail) == null)
+                val synced = if (needsSync) {
+                    val next = existing.copy(fullName = updatedName, email = cleanEmail)
+                    dao.updateUser(next)
+                    next
+                } else {
+                    existing
+                }
+                // Guard against empty wallet/category state if a prior wipe was interrupted
+                if (dao.getCategories(uid).isEmpty()) {
+                    dao.upsertCategories(DefaultAccountTemplates.createDefaultCategories(uid))
+                }
+                if (dao.getWallets(uid).isEmpty()) {
+                    dao.upsertWallet(DefaultAccountTemplates.createStarterWallet(uid))
+                }
+                sessionManager.saveSession(uid, rememberMe = true)
+                return@withTransaction synced.toDomain()
             }
-            sessionManager.saveSession(userId, rememberMe = true)
-            AuthResult.Success(entity.toDomain())
-        } catch (_: SQLiteConstraintException) {
-            AuthResult.Error("An account with $cleanEmail already exists. Please log in instead.")
-        } catch (e: Exception) {
-            AuthResult.Error(e.localizedMessage ?: "Unable to create account. Please try again.")
+
+            // If an older pre-Firebase local record occupied the same email under a different ID,
+            // archive its email key so the verified Firebase UID owns the canonical email cleanly.
+            val conflicting = dao.getUserByEmail(cleanEmail)
+            if (conflicting != null && conflicting.id != uid) {
+                dao.updateUser(conflicting.copy(email = "archived_${conflicting.id}_${conflicting.email}"))
+            }
+
+            val defaultBudget = when (preferredCurrency) {
+                CurrencyCode.INR -> 50000.0
+                CurrencyCode.JPY -> 200000.0
+                else -> 2500.0
+            }
+
+            val newUser = UserEntity(
+                id = uid,
+                fullName = resolvedName,
+                email = cleanEmail,
+                passwordHash = "",
+                passwordSalt = "",
+                resetPinHash = "",
+                resetPinSalt = "",
+                currencyCode = preferredCurrency.code,
+                monthlyBudget = defaultBudget,
+                darkMode = true,
+                createdAt = System.currentTimeMillis()
+            )
+            dao.insertUser(newUser)
+            dao.upsertCategories(DefaultAccountTemplates.createDefaultCategories(uid))
+            dao.upsertWallet(
+                DefaultAccountTemplates.createStarterWallet(
+                    userId = uid,
+                    initialBalance = FinanceMath.roundCurrency(startingBalance.coerceAtLeast(0.0))
+                )
+            )
+            sessionManager.saveSession(uid, rememberMe = true)
+            newUser.toDomain()
         }
     }
 
-    suspend fun logIn(email: String, password: String, rememberMe: Boolean): AuthResult {
-        val cleanEmail = email.trim().lowercase()
-        if (!isValidEmail(cleanEmail)) return AuthResult.Error("Please enter a valid email address.")
-        if (password.isEmpty()) return AuthResult.Error("Please enter your password.")
-
-        val user = dao.getUserByEmail(cleanEmail)
-            ?: return AuthResult.Error("No WalX account found for $cleanEmail. Check your email or create an account.")
-
-        val valid = withContext(Dispatchers.Default) {
-            PasswordHasher.verify(password, user.passwordHash, user.passwordSalt)
-        }
-        if (!valid) {
-            return AuthResult.Error("Incorrect password. Please try again or use Forgot Password.")
-        }
-
-        sessionManager.saveSession(user.id, rememberMe)
-        return AuthResult.Success(user.toDomain())
-    }
-
-    suspend fun resetPasswordWithPin(email: String, resetPin: String, newPassword: String): AuthResult {
-        val cleanEmail = email.trim().lowercase()
-        val cleanPin = resetPin.trim()
-        if (!isValidEmail(cleanEmail)) return AuthResult.Error("Please enter a valid email address.")
-        if (cleanPin.length < 4) return AuthResult.Error("Enter your 4+ character Recovery PIN.")
-        if (newPassword.length < 6) return AuthResult.Error("New password must be at least 6 characters.")
-
-        val user = dao.getUserByEmail(cleanEmail)
-            ?: return AuthResult.Error("No account registered with $cleanEmail.")
-
-        val pinValid = withContext(Dispatchers.Default) {
-            PasswordHasher.verify(cleanPin, user.resetPinHash, user.resetPinSalt)
-        }
-        if (!pinValid) {
-            return AuthResult.Error("Recovery PIN did not match our records.")
-        }
-
-        val newHash = withContext(Dispatchers.Default) {
-            PasswordHasher.hash(newPassword)
-        }
-        val updated = user.copy(passwordHash = newHash.hashHex, passwordSalt = newHash.saltHex)
-        dao.updateUser(updated)
-        return AuthResult.Success(updated.toDomain())
-    }
-
-    fun signOut() {
+    fun clearLocalSessionMarker() {
         sessionManager.clearSession()
     }
 
@@ -555,9 +512,6 @@ class WalXRepository(
             }
         }
     }
-
-    private fun isValidEmail(email: String): Boolean =
-        Regex("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$").matches(email)
 }
 
 data class UserExportSnapshot(

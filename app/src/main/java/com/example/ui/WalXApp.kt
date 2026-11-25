@@ -41,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -163,16 +164,18 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                     ) { innerPadding ->
                         Box(modifier = Modifier.padding(innerPadding)) {
                             AuthScreen(
-                                hasRegisteredAccounts = state.hasRegisteredAccounts,
                                 authError = state.authError,
                                 authBusy = state.authBusy,
-                                resetPasswordError = state.resetPasswordError,
-                                resetPasswordBusy = state.resetPasswordBusy,
                                 onClearError = viewModel::clearAuthError,
-                                onClearResetError = viewModel::clearResetPasswordError,
-                                onLogIn = viewModel::logIn,
-                                onSignUp = viewModel::signUp,
-                                onResetPassword = viewModel::resetPasswordWithPin
+                                onAttemptAutoSignIn = { viewModel.attemptAutoSignInIfEligible(context) },
+                                onContinueWithGoogle = { name, currency, openingBalance ->
+                                    viewModel.signInWithGoogle(
+                                        activityContext = context,
+                                        preferredDisplayName = name,
+                                        startingCurrency = currency,
+                                        startingBalance = openingBalance
+                                    )
+                                }
                             )
                         }
                     }
@@ -181,10 +184,11 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                 is AuthUiState.Authenticated -> {
                     val user = auth.user
 
-                    // Return to Dashboard on Back press from secondary tabs
-                    BackHandler(enabled = state.activeTab != WalXTab.DASHBOARD) {
-                        viewModel.selectTab(WalXTab.DASHBOARD)
-                    }
+                    key(user.id) {
+                        // Return to Dashboard on Back press from secondary tabs
+                        BackHandler(enabled = state.activeTab != WalXTab.DASHBOARD) {
+                            viewModel.selectTab(WalXTab.DASHBOARD)
+                        }
 
                     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                         val useRail = maxWidth >= 700.dp
@@ -264,7 +268,7 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                                             user = user,
                                             state = state,
                                             onToggleTheme = viewModel::toggleDarkMode,
-                                            onSignOut = viewModel::signOut,
+                                            onSignOut = { viewModel.signOut(context) },
                                             onQuickAddTransaction = viewModel::openNewTransactionModal,
                                             onInspectWallet = viewModel::inspectWalletInLedger,
                                             onSelectCashflowRange = viewModel::setCashflowRange,
@@ -341,7 +345,7 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                                                 }
                                             },
                                             onClearAllData = viewModel::clearAllUserData,
-                                            onSignOut = viewModel::signOut
+                                            onSignOut = { viewModel.signOut(context) }
                                         )
                                     }
                                 }
@@ -358,6 +362,7 @@ fun WalXApp(viewModel: WalXViewModel = viewModel()) {
                                 onSave = viewModel::saveTransaction
                             )
                         }
+                    }
                     }
                 }
             }
