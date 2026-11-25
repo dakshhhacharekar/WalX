@@ -9,7 +9,6 @@ import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.NoCredentialException
-import com.example.R
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
@@ -69,19 +68,19 @@ private const val AUTH_TAG = "Auth"
  * Sign-Up via Jetpack Credential Manager, and leak-free session teardown on sign-out.
  */
 class AuthenticationProvider(
-    private val firebaseAuth: FirebaseAuth = Firebase.auth
+    private val firebaseAuth: FirebaseAuth? = runCatching { Firebase.auth }.getOrNull()
 ) {
     /**
      * Current signed-in Firebase account, or null if unauthenticated.
      */
     val currentAccount: AuthenticatedAccount?
-        get() = firebaseAuth.currentUser?.toAuthenticatedAccount()
+        get() = firebaseAuth?.currentUser?.toAuthenticatedAccount()
 
     /**
      * Returns the verified Firebase UID for the current session, or throws if unauthenticated.
      */
     fun requireUserId(): String =
-        firebaseAuth.currentUser?.uid
+        firebaseAuth?.currentUser?.uid
             ?: throw IllegalStateException("User must be signed in to access WalX data.")
 
     /**
@@ -89,8 +88,14 @@ class AuthenticationProvider(
      * token refresh, and sign-out.
      */
     fun observeAuthState(): Flow<AuthSessionEvent> = callbackFlow {
-        val listener = FirebaseAuth.AuthStateListener { auth ->
-            val user = auth.currentUser
+        val auth = firebaseAuth
+        if (auth == null) {
+            trySend(AuthSessionEvent.Unauthenticated)
+            close()
+            return@callbackFlow
+        }
+        val listener = FirebaseAuth.AuthStateListener { state ->
+            val user = state.currentUser
             trySend(
                 if (user != null) {
                     AuthSessionEvent.Authenticated(user.toAuthenticatedAccount())
@@ -99,9 +104,9 @@ class AuthenticationProvider(
                 }
             )
         }
-        firebaseAuth.addAuthStateListener(listener)
+        auth.addAuthStateListener(listener)
         awaitClose {
-            firebaseAuth.removeAuthStateListener(listener)
+            auth.removeAuthStateListener(listener)
         }
     }.distinctUntilChanged()
 
@@ -178,7 +183,7 @@ class AuthenticationProvider(
             } catch (e: Exception) {
                 Log.w(AUTH_TAG, "Credential state clear skipped during sign-out", e)
             } finally {
-                firebaseAuth.signOut()
+                firebaseAuth?.signOut()
             }
         }
     }
@@ -188,6 +193,11 @@ class AuthenticationProvider(
         request: GetCredentialRequest,
         suppressNoCredentialError: Boolean
     ): AuthActionResult {
+        val auth = firebaseAuth
+            ?: return AuthActionResult.Error(
+                "Firebase is not configured in this build. Ensure app/google-services.json is included and rebuild."
+            )
+
         return try {
             val credentialManager = CredentialManager.create(activityContext)
             val response = credentialManager.getCredential(
@@ -204,7 +214,7 @@ class AuthenticationProvider(
 
             val googleIdCredential = GoogleIdTokenCredential.createFrom(credential.data)
             val firebaseCredential = GoogleAuthProvider.getCredential(googleIdCredential.idToken, null)
-            val authResult = firebaseAuth.signInWithCredential(firebaseCredential).await()
+            val authResult = auth.signInWithCredential(firebaseCredential).await()
             val firebaseUser = authResult.user
                 ?: return AuthActionResult.Error("Sign-in succeeded, but no user profile was returned.")
 
@@ -246,7 +256,12 @@ class AuthenticationProvider(
 
     private fun resolveWebClientId(context: Context): String? {
         return runCatching {
-            context.getString(R.string.default_web_client_id).trim()
+            val resId = context.resources.getIdentifier(
+                "default_web_client_id",
+                "string",
+                context.packageName
+            )
+            if (resId != 0) context.getString(resId).trim() else null
         }.getOrNull()?.takeIf { it.isNotEmpty() }
     }
 
